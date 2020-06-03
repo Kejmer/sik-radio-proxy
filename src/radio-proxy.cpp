@@ -8,7 +8,6 @@
 #include <unistd.h>
 #include <algorithm>
 
-#include "../include/err.hpp"
 #include "../include/params.hpp"
 
 #define BUFF_SIZE 8096
@@ -34,6 +33,7 @@ size_t readSock(FILE *sock) {
   return buff_len;
 }
 
+// Helper function to read header line by line
 bool s_getline(FILE *fp, std::string &str) {
   char *cline = NULL;
   size_t len = BUFF_SIZE;
@@ -46,7 +46,7 @@ bool s_getline(FILE *fp, std::string &str) {
   return true;
 }
 
-// Funkcja zwraca 0 gdy status nie był 200
+// Return 0 if status is not 200 and move fp to the end of header
 size_t readHeader(FILE *fp, bool get_meta_int) {
   size_t interval = 1;
   std::string line;
@@ -80,7 +80,7 @@ size_t readHeader(FILE *fp, bool get_meta_int) {
   return interval;
 }
 
-void readToOut(int length, FILE *from, FILE *where) {
+void readAndPrint(int length, FILE *from, FILE *where) {
   while (length > 0) {
     if (last_read >= buff_len)
        readSock(from);
@@ -96,15 +96,15 @@ void readToOut(int length, FILE *from, FILE *where) {
   }
 }
 
-void readRadio(FILE *fp, int length) {
+void readRadio(int length, FILE *from) {
   if (length == 0) {
-    if (readSock(fp) <= 0)
+    if (readSock(from) <= 0)
       int_flag = true;
     else
       print_buff(last_read, buff_len, stdout);
     return;
   }
-  readToOut(length, fp, stdout);
+  readAndPrint(length, from, stdout);
 }
 
 void readMeta(FILE *fp) {
@@ -112,84 +112,88 @@ void readMeta(FILE *fp) {
     readSock(fp);
   int length = 16 * (int)buff[last_read++];
 
-  std::cerr << "TERAZ META DŁUGOŚCI " << length << std::endl;
-  readToOut(length, fp, stderr);
+  readAndPrint(length, fp, stderr);
 }
 
 int main(int argc, char *argv[]) {
   struct sigaction action;
   sigset_t block_mask;
 
+  // SIGINT handling
   sigemptyset (&block_mask);
   action.sa_handler = setInteruptFlag;
   action.sa_mask = block_mask;
   action.sa_flags = SA_RESTART;
 
   if (sigaction (SIGINT, &action, 0) == -1)
-    syserr("sigaction");
+    exit(1);
 
+  // Params handling
   ParamsRadio params = ParamsRadio(argc, argv);
-  params.printAll();
 
-  int err;
+  // Setup connection info
   struct addrinfo addr_hints;
   struct addrinfo *addr_result;
 
-  // Setup connection info
   memset(&addr_hints, 0, sizeof(struct addrinfo));
   addr_hints.ai_family = AF_INET;
   addr_hints.ai_socktype = SOCK_STREAM;
   addr_hints.ai_protocol = IPPROTO_TCP;
   std::string host = params.getHost();
   std::string port = params.getServerPort();
-  err = getaddrinfo(host.c_str(), port.c_str(), &addr_hints, &addr_result);
-  if (err)
-    syserr("getaddrinfo %d", err);
+  if (getaddrinfo(host.c_str(), port.c_str(), &addr_hints, &addr_result) != 0)
+    exit(1);
 
-
+  // Socket
   int sock_tcp = socket(addr_result->ai_family, addr_result->ai_socktype, addr_result->ai_protocol);
   if (sock_tcp < 0)
-    syserr("socket_tcp");
+    exit(1);
 
-  // timeout.tv_sec = 0;
-  // timeout.tv_usec = 500000;
-  // if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (void *)&timeout, sizeof(timeout)) < 0)
-  //   syserr("setsockopt failed");
-
+  // Timeout setup
   struct timeval timeout = params.getServerTimeout();
-  if (setsockopt(sock_tcp, SOL_SOCKET, SO_RCVTIMEO, (void *)&timeout, sizeof(timeout)) < 0)
-    syserr("setsockopt");
+  if (setsockopt(sock_tcp, SOL_SOCKET, SO_RCVTIMEO, (void *)&timeout, sizeof(timeout)) < 0) {
+    close(sock_tcp);
+    exit(1);
+  }
 
-  if (connect(sock_tcp, addr_result->ai_addr, addr_result->ai_addrlen) < 0)
-    syserr("connect");
+  // Connect to server
+  if (connect(sock_tcp, addr_result->ai_addr, addr_result->ai_addrlen) < 0) {
+    close(sock_tcp);
+    exit(1);
+  }
   freeaddrinfo(addr_result);
 
+  // Send request to radio provider
   std::string request_s = params.getRequest();
   const char *request = request_s.c_str();
-  if (write(sock_tcp, request, strlen(request)) < 0)
-    syserr("write");
+  if (write(sock_tcp, request, strlen(request)) < 0) {
+    close(sock_tcp);
+    exit(1);
+  }
 
-  std::cerr << request_s << std::endl;
+  FILE *serv_d = fdopen(sock_tcp, "r"); // we'll use socket as file descriptor
 
-  FILE *serv_d = fdopen(sock_tcp, "r");
-
+  // Get Metadata interval
   size_t icy_metaint = readHeader(serv_d, params.getSendMetadata());
   if (icy_metaint == 0) {
     fclose(serv_d);
     exit(1);
   }
 
+  // If we didn't request metadata we'll skip it
   if (!params.getSendMetadata())
     icy_metaint = 0;
 
+  // Start reading
   bool meta_turn = false;
   while (!int_flag) {
-    if (meta_turn && params.getSendMetadata()) {
+    if (meta_turn && params.getSendMetadata())
       readMeta(serv_d);
-    } else {
-      readRadio(serv_d, icy_metaint);
-    }
+    else
+      readRadio(icy_metaint, serv_d);
     meta_turn = !meta_turn;
   }
+
+  // Close connection
   fclose(serv_d);
 }

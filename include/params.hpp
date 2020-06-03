@@ -19,8 +19,6 @@ public:
 
   std::string getRequest();
 
-  void printAll();
-
 private:
   bool send_metadata;
   std::string host;
@@ -37,10 +35,6 @@ private:
 
   bool hasBPort;
   bool hasMulticast;
-
-  bool variant_B; // radio should be a proxy
-
-  bool isOptionB(std::string option);
 };
 
 #endif /* PARAMS_HPP */

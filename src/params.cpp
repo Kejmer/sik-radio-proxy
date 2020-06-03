@@ -1,13 +1,8 @@
 #include <iostream>
 
-#include "../include/err.hpp"
 #include "../include/params.hpp"
 
 namespace {
-  void badParams() {
-    syserr("Error while parsing params");
-  }
-
   std::string parsePort(std::string value) {
     unsigned port;
     try {
@@ -16,17 +11,14 @@ namespace {
       port = 0;
     }
     if (port < MIN_PORT || MAX_PORT < port)
-      syserr("Invalid port number");
+      exit(1);
     return value;
   }
 
   bool parseYesNo(std::string value) {
-    if (value == "no")
-      return false;
     if (value == "yes")
       return true;
-    syserr("Invalid option for -m");
-    return false; // unreachable
+    return false; // every other options are treated as a "no"
   }
 
   int parseTimeout(std::string value) {
@@ -34,7 +26,7 @@ namespace {
     try {
       timeout = std::stoi(value);
     } catch (...) {
-      syserr("Invalid timeout value");
+      exit(1);
     }
     return timeout;
   }
@@ -42,13 +34,12 @@ namespace {
 
 ParamsRadio::ParamsRadio(int argc, char *argv[]) {
   if (argc % 2 == 0)
-    badParams();
+    exit(1);
 
   // set default values
   this->send_metadata = false;
   this->server_timeout.tv_sec = 5;
   this->server_timeout.tv_usec = 0;
-  this->variant_B = false;
 
   this->proxy_timeout.tv_sec = 5;
   this->proxy_timeout.tv_usec = 0;
@@ -81,11 +72,8 @@ ParamsRadio::ParamsRadio(int argc, char *argv[]) {
     else if (option == "-t") {
       this->server_timeout.tv_sec = parseTimeout(value);
     }
-    else if (isOptionB(option)) {
-      std::cerr << "Part B is not implemented\n";
-      exit(2);
-    }
     else if (option == "-P") {
+      exit(2);
       this->proxy_port = parsePort(value);
       this->hasBPort = true;
     }
@@ -96,22 +84,10 @@ ParamsRadio::ParamsRadio(int argc, char *argv[]) {
     else if (option == "-T") {
       this->proxy_timeout.tv_sec = parseTimeout(value);
     }
-    else {
-      badParams();
-    }
   }
 
   if (!hasHost || !hasPort || !hasResource)
-    badParams();
-
-  if (variant_B && !hasBPort)
-    badParams();
-}
-
-bool ParamsRadio::isOptionB(std::string option) {
-  if (option == "-P" || option == "-B" || option == "-T")
-    return variant_B = true;
-  return false;
+    exit(1);
 }
 
 bool ParamsRadio::getSendMetadata() {
@@ -139,25 +115,11 @@ struct timeval ParamsRadio::getServerTimeout() {
   return server_timeout;
 }
 
-void ParamsRadio::printAll() {
-  std::cout
-    << "resource: " << resource << std::endl
-    << "host: " << host << std::endl
-    << "server_port: " << server_port << std::endl;
-    // << "server_timeout: " << server_timeout << std::endl;
-  if (variant_B)
-  std::cout
-    << "proxy_port: " << proxy_port << std::endl
-    // << "proxy_timeout: " << proxy_timeout << std::endl
-    << "multicast_addr: " << multicast_addr << std::endl;
-}
-
 std::string ParamsRadio::getRequest() {
   std::string request = "GET ";
   request += resource;
   request += " HTTP/1.1\r\nHost: ";
   request += host;
-  // request += "\r\nUser-Agent: Ecast";
   request += "\r\nIcy-MetaData: ";
   request += (send_metadata ? "1" : "0");
   request += "\r\n\r\n";
