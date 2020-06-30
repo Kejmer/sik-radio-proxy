@@ -7,24 +7,207 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <algorithm>
+#include <thread>
+#include <netinet/in.h>
+#include <mutex>
+#include <map>
+#include <sys/time.h>
+#include <poll.h>
+
 
 #include "../include/params.hpp"
 
+#define DISCOVER 1
+#define IAM 2
+#define KEEPALIVE 3
+#define AUDIO 4
+#define META 6
+
 #define BUFF_SIZE 8096
+#define HEADER_SIZE 4
+
+char header[HEADER_SIZE];
+char buff_udp[HEADER_SIZE];
 char buff[BUFF_SIZE];
+size_t last_read_udp;
 size_t last_read;
+size_t buff_len_udp;
 size_t buff_len;
+
+bool radio_b;
+int sock_udp;
+std::string radio_name = "";
+
+std::mutex client_map_mutex;
+
 static bool int_flag = false;
+static bool thread_failed = false;
 
 static void setInteruptFlag(int sig) {
+  (void) sig;
   int_flag = true;
 }
 
-void print_buff(size_t beg, size_t end, FILE *where) {
-  fwrite(buff + beg, end - beg, 1, where);
+struct comp
+{
+  template<typename T>
+  bool operator()(const T &lhs, const T &rhs) const
+  {
+    if (lhs.sin_port != rhs.sin_port)
+      return lhs.sin_port > rhs.sin_port;
+    return lhs.sin_addr.s_addr > rhs.sin_addr.s_addr;
+  }
+};
+std::map<struct sockaddr_in, struct timeval, comp> client_map;
+
+// Handling CLIENT --- PROXY requests
+
+short parseHeader() {
+  short type;
+  memcpy(&type, buff_udp, 2);
+  last_read_udp += 4;
+  return ntohs(type);
 }
 
-size_t readSock(FILE *sock) {
+void createHeader(unsigned short type, unsigned short length, char* c) {
+  type = htons(type);
+  length = htons(length);
+  memcpy(c, &type, 2);
+  memcpy(c + 2, &length, 2);
+}
+
+void refresh_time(struct sockaddr_in client_address) {
+  struct timeval tv;
+  gettimeofday(&tv, 0);
+  client_map[client_address] = tv;
+}
+
+void proxy_iam() {
+  createHeader(IAM, (short)radio_name.size(), buff_udp);
+}
+
+void proxy_radio(size_t beg, size_t end, short type, int timeout) {
+  createHeader(type, end-beg, header);
+  size_t snda_len = (socklen_t) sizeof(struct sockaddr_in);
+  int flags = 0;
+  std::map<struct sockaddr_in, struct timeval>::iterator it, next_it;
+  struct timeval now;
+  gettimeofday(&now, 0);
+
+  size_t msg_len = HEADER_SIZE + end - beg;
+  char msg[msg_len];
+  for (size_t i = 0; i < HEADER_SIZE; i++)
+    msg[i] = header[i];
+  for (size_t i = HEADER_SIZE; i < msg_len; i++)
+    msg[i] = buff[beg + i - HEADER_SIZE];
+
+  client_map_mutex.lock();
+  for (it = client_map.begin(), next_it = it; it != client_map.end(); it = next_it) {
+    next_it++;
+    if (it->second.tv_sec + timeout < now.tv_sec ||
+       (it->second.tv_sec + timeout == now.tv_sec && it->second.tv_usec >= now.tv_usec)) {
+      client_map.erase(it);
+    } else {
+      sendto(sock_udp, msg, (size_t) msg_len, flags,
+              (struct sockaddr *) &it->first, snda_len);
+    }
+  }
+  client_map_mutex.unlock();
+}
+
+void proxy_audio(size_t beg, size_t end, int timeout) {
+  proxy_radio(beg, end, AUDIO, timeout);
+}
+
+void proxy_meta(size_t beg, size_t end, int timeout) {
+  proxy_radio(beg, end, META, timeout);
+}
+
+void handle_proxy(int port) {
+  struct sockaddr_in server_address;
+  struct sockaddr_in client_address;
+  socklen_t snda_len, rcva_len;
+
+  sock_udp = socket(AF_INET, SOCK_DGRAM, 0); // creating IPv4 UDP socket
+  if (sock_udp < 0) {
+    int_flag = true;
+    thread_failed = true;
+    return;
+  }
+
+  server_address.sin_family = AF_INET; // IPv4
+  server_address.sin_addr.s_addr = htonl(INADDR_ANY); // listening on all interfaces
+  server_address.sin_port = htons(port); // default port for receiving is PORT_NUM
+
+  if (bind(sock_udp, (struct sockaddr *) &server_address,
+          (socklen_t) sizeof(server_address)) < 0) {
+    int_flag = true;
+    thread_failed = true;
+    return;
+  }
+
+  int flags = 0;
+  short type;
+  size_t len;
+
+  proxy_iam();
+  size_t msg_len = radio_name.size() + HEADER_SIZE;
+  char msg[msg_len + 1];
+  for (size_t i = 0; i < HEADER_SIZE; i++)
+    msg[i] = buff_udp[i];
+  for (size_t i = HEADER_SIZE; i < msg_len; i++)
+    msg[i] = radio_name[i - HEADER_SIZE];
+  msg[msg_len] = 0;
+
+  snda_len = (socklen_t) sizeof(client_address);
+
+  struct pollfd udp_poll;
+  int res;
+  udp_poll.fd = sock_udp;
+  udp_poll.events = POLLIN;
+  while (!int_flag) {
+    res = poll(&udp_poll, 1, 2000); // 10 s timeout
+    if (res <= 0) {
+      len = 0;
+    } else {
+      len = recvfrom(sock_udp, buff_udp, HEADER_SIZE, flags,
+          (struct sockaddr *) &client_address, &rcva_len);
+    }
+    if (len < 4) {
+      //error while reading socket or incomplete msg, skipping
+    } else {
+      type = parseHeader();
+
+      client_map_mutex.lock();
+      switch(type) {
+      case DISCOVER:
+        sendto(sock_udp, msg, (size_t) msg_len, flags,
+            (struct sockaddr *) &client_address, snda_len);
+        refresh_time(client_address);
+        break;
+      case KEEPALIVE:
+        refresh_time(client_address);
+      }
+      client_map_mutex.unlock();
+    }
+  }
+}
+
+// Handling PROXY --- SERVER connection
+
+void print_buff(size_t beg, size_t end, FILE *where, int timeout) {
+  if (radio_b) {
+    if (where == stdout) {
+      proxy_audio(beg, end, timeout);
+    } else {
+      proxy_meta(beg, end, timeout);
+    }
+  } else {
+    fwrite(buff + beg, end - beg, 1, where);
+  }
+}
+
+size_t readSockTcp(FILE *sock) {
   memset(buff, 0, sizeof(buff));
   buff_len = fread(buff, 1, sizeof(buff), sock);
   last_read = 0;
@@ -51,6 +234,7 @@ size_t readHeader(FILE *fp, bool get_meta_int) {
   size_t interval = 1;
   std::string line;
   std::string metaint = "icy-metaint:";
+  std::string metaname = "icy-name:";
 
   if (!s_getline(fp, line))
     return 1;
@@ -65,14 +249,20 @@ size_t readHeader(FILE *fp, bool get_meta_int) {
         return 1;
       std::transform(line.begin(), line.end(), line.begin(),
         [](unsigned char c){ return std::tolower(c); });
-      std::cout << line;
+      found = line.find(metaname);
+      if (found != std::string::npos)
+        radio_name = line.substr(metaname.size());
       found = line.find(metaint);
+
       if (line == "\r\n") return 0;
     }
     interval = stoi(line.substr(metaint.size()));
   }
 
   while (line != "\r\n") {
+    found = line.find(metaname);
+    if (found != std::string::npos)
+      radio_name = line.substr(metaname.size());
     if (!s_getline(fp, line))
       return 1;
   }
@@ -80,10 +270,10 @@ size_t readHeader(FILE *fp, bool get_meta_int) {
   return interval;
 }
 
-void readAndPrint(int length, FILE *from, FILE *where) {
+void readAndPrint(int length, FILE *from, FILE *where, int timeout) {
   while (length > 0) {
     if (last_read >= buff_len)
-       readSock(from);
+       readSockTcp(from);
     if (buff_len == 0) {
       int_flag = true;
       return;
@@ -91,30 +281,29 @@ void readAndPrint(int length, FILE *from, FILE *where) {
 
     size_t end = std::min(last_read + length, buff_len);
     length -= (end - last_read);
-    print_buff(last_read, end, where);
+    print_buff(last_read, end, where, timeout);
     last_read = end;
   }
 }
 
-void readRadio(int length, FILE *from) {
+void readRadio(int length, FILE *from, int timeout) {
   if (length == 0) {
-    if (readSock(from) <= 0)
+    if (readSockTcp(from) <= 0)
       int_flag = true;
     else
-      print_buff(last_read, buff_len, stdout);
+      print_buff(last_read, buff_len, stdout, timeout);
     return;
   }
-  readAndPrint(length, from, stdout);
+  readAndPrint(length, from, stdout, timeout);
 }
 
-void readMeta(FILE *fp) {
+void readMeta(FILE *fp, int timeout) {
   if (last_read >= BUFF_SIZE)
-    readSock(fp);
+    readSockTcp(fp);
   int length = 16 * (int)buff[last_read++];
 
-  readAndPrint(length, fp, stderr);
+  readAndPrint(length, fp, stderr, timeout);
 }
-
 int main(int argc, char *argv[]) {
   struct sigaction action;
   sigset_t block_mask;
@@ -130,6 +319,7 @@ int main(int argc, char *argv[]) {
 
   // Params handling
   ParamsRadio params = ParamsRadio(argc, argv);
+  radio_b = params.getVariantB();
 
   // Setup connection info
   struct addrinfo addr_hints;
@@ -180,6 +370,12 @@ int main(int argc, char *argv[]) {
     exit(1);
   }
 
+  std::thread proxy_connections;
+
+  if (radio_b) {
+    proxy_connections = std::thread(handle_proxy, stoi(params.getProxyPort()));
+  }
+
   // If we didn't request metadata we'll skip it
   if (!params.getSendMetadata())
     icy_metaint = 0;
@@ -188,11 +384,19 @@ int main(int argc, char *argv[]) {
   bool meta_turn = false;
   while (!int_flag) {
     if (meta_turn && params.getSendMetadata())
-      readMeta(serv_d);
+      readMeta(serv_d, params.getProxyTimeout().tv_sec);
     else
-      readRadio(icy_metaint, serv_d);
+      readRadio(icy_metaint, serv_d, params.getProxyTimeout().tv_sec);
     meta_turn = !meta_turn;
   }
+
+  if (radio_b) {
+    proxy_connections.join();
+    close(sock_udp);
+  }
+
+  if (thread_failed)
+    exit(1);
 
   // Close connection
   fclose(serv_d);

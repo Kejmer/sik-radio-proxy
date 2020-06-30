@@ -8,6 +8,7 @@ class ParamsRadio {
 public:
   ParamsRadio(int argc, char *argv[]);
 
+  bool getVariantB();
   bool getSendMetadata();
   std::string getHost();
   std::string getResource();
@@ -33,7 +34,7 @@ private:
   bool hasPort;
   bool hasResource;
 
-  bool hasBPort;
+  bool variantB;
   bool hasMulticast;
 };
 

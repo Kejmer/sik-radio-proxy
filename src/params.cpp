@@ -16,9 +16,8 @@ namespace {
   }
 
   bool parseYesNo(std::string value) {
-    if (value == "yes")
-      return true;
-    return false; // every other options are treated as a "no"
+    return value == "yes";
+    // every other options are treated as a "no"
   }
 
   int parseTimeout(std::string value) {
@@ -48,7 +47,8 @@ ParamsRadio::ParamsRadio(int argc, char *argv[]) {
   this->hasPort = false;
   this->hasResource = false;
 
-  this->hasBPort = false;
+
+  this->variantB = false;
   this->hasMulticast = false;
 
   for (int i = 1; i < argc; i+=2) {
@@ -73,9 +73,8 @@ ParamsRadio::ParamsRadio(int argc, char *argv[]) {
       this->server_timeout.tv_sec = parseTimeout(value);
     }
     else if (option == "-P") {
-      exit(2);
+      this->variantB = true;
       this->proxy_port = parsePort(value);
-      this->hasBPort = true;
     }
     else if (option == "-B") {
       this->multicast_addr = value;
@@ -90,6 +89,10 @@ ParamsRadio::ParamsRadio(int argc, char *argv[]) {
     exit(1);
 }
 
+
+bool ParamsRadio::getVariantB() {
+  return variantB;
+}
 bool ParamsRadio::getSendMetadata() {
   return send_metadata;
 }
@@ -114,6 +117,7 @@ struct timeval ParamsRadio::getProxyTimeout() {
 struct timeval ParamsRadio::getServerTimeout() {
   return server_timeout;
 }
+
 
 std::string ParamsRadio::getRequest() {
   std::string request = "GET ";
